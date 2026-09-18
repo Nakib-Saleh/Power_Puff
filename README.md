@@ -13,7 +13,7 @@ electricity schedule.
 | **Health** | `GET /health` → `{"status":"ok"}` |
 | **Main endpoint** | `POST /optimize-energy` |
 | **Docker image** | `<FILL IN AT SUBMISSION>` |
-| **Model / provider** | Google Gemini (`gemini-2.5-flash`, falling back to `gemini-2.0-flash`) via the Generative Language REST API |
+| **Model / provider** | Primary: **Groq** `openai/gpt-oss-120b` (OpenAI-compatible API), cascading to `qwen/qwen3.8-27b` and `openai/gpt-oss-20b`. Fallback: **Google Gemini** `gemini-3.5-flash` and its lite variants |
 | **Optimizer** | Linear programming — PuLP with the bundled CBC solver |
 
 ---
@@ -35,9 +35,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 
 # Supply an API key (see section 4). On Linux/macOS:
-export GEMINI_API_KEYS=your_key_here
+export OPENAI_COMPAT_API_KEYS=your_groq_key_here
 # Windows PowerShell:
-# $env:GEMINI_API_KEYS = "your_key_here"
+# $env:OPENAI_COMPAT_API_KEYS = "your_groq_key_here"
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
@@ -225,15 +225,20 @@ repository**; `.env.example` documents names only.
 
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
-| `GEMINI_API_KEYS` | yes | — | One key, or several comma-separated. Extra keys rotate automatically when one hits its rate limit. `GEMINI_API_KEY` is also accepted. |
-| `GEMINI_MODEL` | no | `gemini-2.5-flash,gemini-2.0-flash` | Comma-separated preference list; the first that answers is used. |
-| `OPENAI_COMPAT_API_KEYS` | no | — | Optional secondary provider (any OpenAI-compatible endpoint, e.g. Groq). |
-| `OPENAI_COMPAT_BASE_URL` | no | `https://api.groq.com/openai/v1` | Secondary provider base URL. |
-| `OPENAI_COMPAT_MODEL` | no | `llama-3.3-70b-versatile` | Secondary provider model. |
-| `LLM_TIMEOUT_SECONDS` | no | `8` | Per-attempt model timeout, kept far below the 30 s request limit. |
+| `OPENAI_COMPAT_API_KEYS` | yes* | — | Primary interpreter. One key or several comma-separated. Groq by default. |
+| `OPENAI_COMPAT_BASE_URL` | no | `https://api.groq.com/openai/v1` | Primary provider base URL. Any OpenAI-compatible endpoint works. |
+| `OPENAI_COMPAT_MODEL` | no | `openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b` | Comma-separated cascade. Groq meters its free tier *per model*, so a rate-limited model rolls to the next. |
+| `GEMINI_API_KEYS` | yes* | — | Fallback interpreter. One key or several comma-separated; keys rotate on quota errors. `GEMINI_API_KEY` also accepted. |
+| `GEMINI_MODEL` | no | `gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-flash-latest` | Fallback cascade; the first model that answers is used. |
+| `LLM_TIMEOUT_SECONDS` | no | `12` | Per-attempt model timeout, kept far below the 30 s request limit. |
 | `PORT` | no | `8000` | Port the service binds on (always `0.0.0.0`). |
 
-Get a free Gemini key at <https://aistudio.google.com/apikey>.
+\* At least one of the two providers must be configured. With both set, the service
+survives either one being rate-limited or down. With neither, it still returns valid
+plans via the deterministic fallback parser, but that does not satisfy the challenge's
+LLM requirement.
+
+Free keys: Groq at <https://console.groq.com/keys>, Gemini at <https://aistudio.google.com/apikey>.
 
 ---
 
@@ -258,7 +263,7 @@ To build it yourself:
 
 ```bash
 docker build -t gridwise-llm:local .
-docker run --rm -p 8000:8000 -e GEMINI_API_KEYS=your_key_here gridwise-llm:local
+docker run --rm -p 8000:8000 -e OPENAI_COMPAT_API_KEYS=your_groq_key_here gridwise-llm:local
 ```
 
 Without an API key the container still starts and answers every request with a valid

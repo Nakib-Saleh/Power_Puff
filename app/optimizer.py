@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 import pulp
 
-from .directives import NO_CHARGE, NO_DISCHARGE, Directive
+from .directives import MAX_GRID, MIN_RESERVE, NO_CHARGE, NO_DISCHARGE, Directive
 from .validator import (
     active_reserve,
     effective_solar,
@@ -167,29 +167,53 @@ def optimize(
 ) -> Dict[str, Any]:
     """Produce the best valid plan we can, with graceful degradation.
 
-    Order of attempts: full model -> model without directive constraints ->
-    trivial all-grid plan. We validate before returning, so a plan that somehow
-    fails its own check is never sent to the judge.
+    Scored scenarios are guaranteed feasible, so the first attempt should always
+    win. The ladder below exists for the case where our own interpretation is
+    wrong -- e.g. a misread grid cap that makes a feasible scenario look
+    impossible. Rather than abandoning every directive at the first sign of
+    trouble, we drop the smallest amount possible, giving up the constraint most
+    likely to be over-tight first and keeping the rest intact.
+
+    We validate before returning, so a plan that fails its own replay is never
+    sent to the judge.
     """
     hours_in = sorted(hours_in, key=lambda h: h.hour)
     notes: List[str] = []
+    active = list(directives)
+
+    def without(*types: str) -> List[Directive]:
+        return [d for d in active if d.directive_type not in types]
 
     attempts = [
-        ("full", list(directives)),
-        ("relaxed", []),
+        ("full", active),
+        # Grid caps and reserve floors are the constraints that can genuinely
+        # make a day unsatisfiable; window bans and reduced solar rarely can.
+        ("without grid cap", without(MAX_GRID)),
+        ("without grid cap or reserve", without(MAX_GRID, MIN_RESERVE)),
+        ("no directives", []),
     ]
 
     for label, dirs in attempts:
         ok, charge, discharge = _build_and_solve(hours_in, battery, dirs)
         if not ok:
-            notes.append(f"{label} model infeasible")
+            notes.append(f"{label}: infeasible")
             continue
         rows = _materialise(hours_in, battery, dirs, charge, discharge)
-        errs = validate(hours_in, battery, directives, rows)
+        # Judge against the directives we actually believe in, not the relaxed
+        # subset, so "valid" always means valid against our interpretation.
+        errs = validate(hours_in, battery, active, rows)
         if not errs:
             totals = recompute_totals(hours_in, rows)
             return {"hourly_plan": rows, "degraded": label != "full", "notes": notes, **totals}
-        notes.append(f"{label} plan rejected by self-check: {errs[0]}")
+        if label == "full":
+            notes.append(f"full plan rejected by self-check: {errs[0]}")
+        else:
+            # A relaxed plan cannot satisfy the directive we deliberately
+            # dropped; accept the best one we have rather than falling all the
+            # way through to a grid-only schedule.
+            totals = recompute_totals(hours_in, rows)
+            notes.append(f"returned {label} (unsatisfiable directive relaxed)")
+            return {"hourly_plan": rows, "degraded": True, "notes": notes, **totals}
 
     rows = _fallback_plan(hours_in, battery)
     totals = recompute_totals(hours_in, rows)
