@@ -31,7 +31,7 @@ flowchart TB
     VAL -->|yes| LLM
 
     subgraph S1["1 - LANGUAGE MODEL  (app/llm.py)"]
-        LLM["One call for all notes, temperature 0, JSON-only<br/>Groq: gpt-oss-120b → qwen3.8-27b → gpt-oss-20b<br/>then Gemini, across 2 accounts / 6 quota buckets"]
+        LLM["One call for all notes, temperature 0, JSON-only<br/>Groq: gpt-oss-120b → qwen3.8-27b → gpt-oss-20b<br/>every (model, key) pair tried, then Gemini"]
     end
 
     subgraph S2["2 - DETERMINISTIC GUARDRAILS  (app/directives.py)"]
@@ -159,7 +159,9 @@ battery ends hour 23 back at 110 kWh, and the three totals match the plan.
 
 ## 2. Running the full public sample suite
 
-Two scripts, both included in the repository.
+Three scripts cover correctness, end-to-end behaviour and robustness. Three more
+(`burst_test.py`, `parallel_test.py`, `pick_model.py`) cover load and model choice —
+see [section 7](#7-repository-layout).
 
 ### Offline — no server and no API key needed
 
@@ -209,46 +211,50 @@ service is still healthy. Expected: `RESULT: survived everything.`
 
 ## 3. Architecture in detail
 
-The diagram at the top of this README gives the overview. This section spells out
-what each stage actually does, in text form.
+The diagram at the top is the six-box overview. This one adds the branches: request
+rejection, the cache, and the two safe-failure paths.
 
+```mermaid
+flowchart TB
+    REQ(["POST /optimize-energy"])
+    VAL{"schema valid?"}
+    REJ["400 · controlled error<br/>no stack trace, no secrets"]
+    CACHE{"these exact notes<br/>seen before?"}
+
+    LLM["1 · LANGUAGE MODEL — app/llm.py<br/>one call for all notes · temperature 0 · flat JSON<br/>Groq: every (model, key) pair → then Gemini"]
+    GR["2 · GUARDRAILS — app/directives.py<br/>unknown type → no_op · hours deduped, 0-23, sorted<br/>factor clamped 0-1 · reserve ≤ capacity<br/>exactly one entry per note, in order"]
+    LP["3 · OPTIMIZER — app/optimizer.py<br/>linear program, 24 h × 5 variables<br/>directives become hard constraints<br/>min Σ grid × tariff → provably optimal, ~50 ms"]
+    CHK["4 · SELF-CHECK — app/validator.py<br/>energy balance · effective solar · battery chain<br/>rate limits · directive windows · end-of-day<br/>totals recomputed from the plan"]
+    RESP(["200 · directive_interpretation<br/>+ hourly_plan + totals + summary"])
+
+    FB["deterministic parser<br/>safe-failure only"]
+    RLX["relax the smallest set<br/>grid cap → + reserve → none"]
+
+    REQ --> VAL
+    VAL -->|no| REJ
+    VAL -->|yes| CACHE
+    CACHE -->|hit| GR
+    CACHE -->|miss| LLM
+    LLM --> GR --> LP --> CHK --> RESP
+
+    LLM -. "every provider down" .-> FB
+    FB -.-> GR
+    LP -. "infeasible" .-> RLX
+    RLX -.-> CHK
+
+    classDef io fill:#e8f6ee,stroke:#2f8f5b,stroke-width:2px,color:#0f2e1e
+    classDef stage fill:#eaf0fb,stroke:#4770b3,stroke-width:1px,color:#11203a
+    classDef safe fill:#fdf3e3,stroke:#b3852a,stroke-width:1px,color:#3a2d11
+    classDef bad fill:#fbeaea,stroke:#b34747,stroke-width:1px,color:#3a1111
+    class REQ,RESP io
+    class LLM,GR,LP,CHK stage
+    class FB,RLX safe
+    class REJ bad
 ```
-  operator_notes (1-3 sentences of ordinary English)
-            |
-            v
-  [ 1. LANGUAGE MODEL ]  app/llm.py
-      One call covers all notes. Temperature 0, JSON-only response mode.
-      Emits a flat structure: directive_type + hours + one numeric field.
-      Several API keys rotate on rate limits; a second provider takes over
-      if the first is unavailable.
-            |
-            v
-  [ 2. DETERMINISTIC GUARDRAILS ]  app/directives.py
-      Model output is untrusted data. Unknown directive types are discarded.
-      Hours are deduplicated, bounded to 0-23 and sorted ascending. A factor
-      outside 0-1 is clamped (and a reduction reported the wrong way round is
-      corrected). Reserves are clamped to battery capacity, grid caps to >= 0.
-      `applies` is forced consistent: false only for no_op. Exactly one entry
-      is produced per note, in note_index order, whatever the model returned.
-            |
-            v
-  [ 3. OPTIMIZER ]  app/optimizer.py
-      A linear program over 24 hours with 5 variables per hour. The validated
-      directives become hard constraints: reduced solar bounds, raised battery
-      floors, zeroed charge/discharge in forbidden windows, capped grid import.
-      Objective: minimise sum(grid_kwh * tariff). The solver returns a provably
-      optimal schedule in roughly 50 ms.
-            |
-            v
-  [ 4. SELF-CHECK ]  app/validator.py
-      Our own copy of the judge replays the finished plan hour by hour before
-      it is returned: energy balance, effective solar, battery chain, bounds,
-      rate limits, every directive window, end-of-day neutrality, and totals
-      recalculated from the plan itself.
-            |
-            v
-  response JSON
-```
+
+Solid arrows are the normal path; dotted arrows are safe-failure paths. Every dotted
+path still ends in a valid 24-hour plan with HTTP 200 — an error response would forfeit
+the whole hidden case.
 
 **Why the language model is genuinely in the path.** The structured interpretation the
 model produces is what becomes the optimizer's constraints — reduced solar, raised
@@ -261,9 +267,12 @@ reconstruct a directive the model did not identify. The guardrail layer only eve
 Every step down still returns a valid 24-hour plan with HTTP 200, because an error
 response would forfeit the whole case:
 
-1. Primary provider (Gemini) answers → normal path.
-2. Primary exhausted or unreachable → secondary OpenAI-compatible provider.
-3. Both unavailable → a deterministic pattern-matching parser (`rule_based` in
+1. **Groq answers → normal path.** Its free tier is metered per model *and* per
+   account, so the client walks every (model, key) pair: `gpt-oss-120b` →
+   `qwen3.8-27b` → `gpt-oss-20b`, across each configured key.
+2. **Every Groq pair rate-limited or unreachable → Gemini**, itself cascading across
+   `gemini-3.5-flash` and its lite variants, rotating keys on quota errors.
+3. Both providers unavailable → a deterministic pattern-matching parser (`rule_based` in
    `app/llm.py`). **This is a safe-failure path only, never the primary interpreter.**
 4. Interpretation fails entirely → all notes treated as `no_op` and a valid plan is
    still produced.
@@ -325,7 +334,9 @@ docker run --rm -p 8000:8000 -e OPENAI_COMPAT_API_KEYS=your_groq_key_here gridwi
 ```
 
 Without an API key the container still starts and answers every request with a valid
-plan, using the deterministic fallback interpreter.
+plan, using the deterministic fallback interpreter. That path exists so the service
+never fails; it does **not** satisfy the challenge's LLM requirement, so supply at least
+one provider key for a representative run.
 
 ---
 
@@ -388,7 +399,8 @@ Dockerfile                  container fallback image
 | [PuLP](https://coin-or.github.io/pulp/) | MIT | Linear programming modelling, bundled CBC solver |
 | [CBC](https://github.com/coin-or/Cbc) | EPL-2.0 | The LP solver itself |
 | [HTTPX](https://www.python-httpx.org/) | BSD-3 | Async HTTP client for model calls |
-| Google Gemini API | — | Operator-note interpretation |
+| [Groq API](https://groq.com/) | — | Operator-note interpretation (primary) |
+| [Google Gemini API](https://ai.google.dev/) | — | Operator-note interpretation (fallback) |
 
 An AI coding assistant was used during development. The architecture, the optimization
 model, the guardrail design, and the validation logic are the team's own work.
