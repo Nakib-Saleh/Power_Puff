@@ -7,3 +7,6 @@ __pycache__/
 venv/
 *.log
 .pytest_cache/
+BUILD_PLAN.md
+script.md
+demo_request.json

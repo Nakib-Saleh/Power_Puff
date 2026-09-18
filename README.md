@@ -18,6 +18,60 @@ electricity schedule.
 
 ---
 
+## Architecture at a glance
+
+```mermaid
+flowchart TB
+    REQ["POST /optimize-energy<br/>24h demand, solar, tariff, battery<br/>+ 1-3 operator notes in plain English"]
+    VAL{"Schema valid?"}
+    REJ["400 — controlled error<br/>no stack trace, no secrets"]
+
+    REQ --> VAL
+    VAL -->|no| REJ
+    VAL -->|yes| LLM
+
+    subgraph S1["1 - LANGUAGE MODEL  (app/llm.py)"]
+        LLM["One call for all notes, temperature 0, JSON-only<br/>Groq: gpt-oss-120b → qwen3.8-27b → gpt-oss-20b<br/>then Gemini, across 2 accounts / 6 quota buckets"]
+    end
+
+    subgraph S2["2 - DETERMINISTIC GUARDRAILS  (app/directives.py)"]
+        GR["Model output treated as untrusted data<br/>unknown type → no_op · hours deduped, clamped 0-23, sorted<br/>factor clamped 0-1 · reserve clamped to capacity<br/>exactly one entry per note, in order"]
+    end
+
+    subgraph S3["3 - OPTIMIZER  (app/optimizer.py)"]
+        OPT["Linear program, 24 hours x 5 variables<br/>directives become hard constraints<br/>minimise Σ grid_kwh × tariff → provably optimal"]
+    end
+
+    subgraph S4["4 - SELF-CHECK  (app/validator.py)"]
+        CHK["Our own replay of the judge<br/>energy balance · effective solar · battery chain<br/>rate limits · directive windows · end-of-day neutrality<br/>totals recomputed from the plan itself"]
+    end
+
+    LLM --> GR --> OPT --> CHK
+    CHK --> RESP["200 — directive_interpretation + hourly_plan<br/>+ totals + plan_summary"]
+
+    LLM -. "every provider down" .-> FB["Deterministic parser<br/>(safe-failure only)"]
+    FB --> GR
+    OPT -. "constraints unsatisfiable" .-> RELAX["Relax the smallest set<br/>rather than all directives"]
+    RELAX --> CHK
+
+    classDef stage fill:#eef4ff,stroke:#4770b3,stroke-width:1px,color:#11203a
+    classDef safe fill:#fff6e6,stroke:#b3852a,stroke-width:1px,color:#3a2d11
+    classDef io fill:#eafaf0,stroke:#2f8f5b,stroke-width:1px,color:#0f2e1e
+    classDef bad fill:#fdeeee,stroke:#b34747,stroke-width:1px,color:#3a1111
+    class LLM,GR,OPT,CHK stage
+    class FB,RELAX safe
+    class REQ,RESP io
+    class REJ bad
+```
+
+**The key idea:** the language model *suggests*, deterministic code *decides*. The model's
+structured output is what becomes the optimizer's constraints — nothing downstream can
+invent a directive the model did not identify — but every value it returns is validated,
+clamped, or discarded before it reaches the solver. Orange boxes are safe-failure paths:
+the service always answers with a valid 24-hour plan rather than an error.
+
+---
+
 ## 1. Quickstart from a clean machine
 
 Requires Python 3.10+ (developed on 3.13, container runs 3.12). No database, no build step.
@@ -153,7 +207,10 @@ service is still healthy. Expected: `RESULT: survived everything.`
 
 ---
 
-## 3. Architecture
+## 3. Architecture in detail
+
+The diagram at the top of this README gives the overview. This section spells out
+what each stage actually does, in text form.
 
 ```
   operator_notes (1-3 sentences of ordinary English)
@@ -309,8 +366,14 @@ app/llm.py          prompt, provider clients, key rotation, cache, safe-failure 
 app/optimizer.py    the linear program and plan construction
 app/validator.py    independent replay of a plan — our own copy of the judge
 app/main.py         FastAPI endpoints and failure policy
-scripts/            the three test scripts described in section 2
-Dockerfile          container fallback image
+scripts/check_samples.py    offline: organizer reference plans + our optimizer
+scripts/test_api.py         end-to-end suite against a running service
+scripts/test_robustness.py  14 hostile / malformed requests
+scripts/burst_test.py       sustained load, distinct paraphrased scenarios
+scripts/parallel_test.py    concurrent load at a chosen concurrency level
+scripts/pick_model.py       benchmarks candidate models on the sample notes
+Dockerfile                  container fallback image
+.env.example                environment variable names (no values)
 ```
 
 ---
