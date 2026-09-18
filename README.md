@@ -211,50 +211,78 @@ service is still healthy. Expected: `RESULT: survived everything.`
 
 ## 3. Architecture in detail
 
-The diagram at the top is the six-box overview. This one adds the branches: request
-rejection, the cache, and the two safe-failure paths.
+The overview diagram at the top shows the shape. This section is what each stage
+actually does.
 
-```mermaid
-flowchart TB
-    REQ(["POST /optimize-energy"])
-    VAL{"schema valid?"}
-    REJ["400 · controlled error<br/>no stack trace, no secrets"]
-    CACHE{"these exact notes<br/>seen before?"}
+### 1 · Language model — `app/llm.py`
 
-    LLM["1 · LANGUAGE MODEL — app/llm.py<br/>one call for all notes · temperature 0 · flat JSON<br/>Groq: every (model, key) pair → then Gemini"]
-    GR["2 · GUARDRAILS — app/directives.py<br/>unknown type → no_op · hours deduped, 0-23, sorted<br/>factor clamped 0-1 · reserve ≤ capacity<br/>exactly one entry per note, in order"]
-    LP["3 · OPTIMIZER — app/optimizer.py<br/>linear program, 24 h × 5 variables<br/>directives become hard constraints<br/>min Σ grid × tariff → provably optimal, ~50 ms"]
-    CHK["4 · SELF-CHECK — app/validator.py<br/>energy balance · effective solar · battery chain<br/>rate limits · directive windows · end-of-day<br/>totals recomputed from the plan"]
-    RESP(["200 · directive_interpretation<br/>+ hourly_plan + totals + summary"])
+All 1–3 notes go out in **one** request, at temperature 0, with the provider's JSON-only
+response mode enabled. The model is asked for a **flat** object per note —
+`directive_type`, `hours`, and one numeric field as siblings — never the nested
+`structured_adjustment` shape the specification wants. Models are markedly more reliable
+at flat fields than at polymorphic nested objects, so our own code assembles the required
+shape afterwards.
 
-    FB["deterministic parser<br/>safe-failure only"]
-    RLX["relax the smallest set<br/>grid cap → + reserve → none"]
+Groq is the primary provider. Its free tier is metered per model *and* per account, so
+the client walks every `(model, key)` pair before giving up, then falls back to Gemini,
+which cascades across its own model list. A per-attempt timeout (`LLM_TIMEOUT_SECONDS`,
+default 12 s) keeps the total far below the judge's 30 s limit. Responses are cached on
+the note text plus battery capacity — capacity matters because *"half the battery"*
+resolves differently per scenario — so a repeated note costs no model call.
 
-    REQ --> VAL
-    VAL -->|no| REJ
-    VAL -->|yes| CACHE
-    CACHE -->|hit| GR
-    CACHE -->|miss| LLM
-    LLM --> GR --> LP --> CHK --> RESP
+### 2 · Deterministic guardrails — `app/directives.py`
 
-    LLM -. "every provider down" .-> FB
-    FB -.-> GR
-    LP -. "infeasible" .-> RLX
-    RLX -.-> CHK
+Model output is treated as untrusted data. Every value is validated, clamped, or dropped
+before it reaches the solver:
 
-    classDef io fill:#e8f6ee,stroke:#2f8f5b,stroke-width:2px,color:#0f2e1e
-    classDef stage fill:#eaf0fb,stroke:#4770b3,stroke-width:1px,color:#11203a
-    classDef safe fill:#fdf3e3,stroke:#b3852a,stroke-width:1px,color:#3a2d11
-    classDef bad fill:#fbeaea,stroke:#b34747,stroke-width:1px,color:#3a1111
-    class REQ,RESP io
-    class LLM,GR,LP,CHK stage
-    class FB,RLX safe
-    class REJ bad
+- a `directive_type` outside the six supported values becomes `no_op`
+- `hours` are de-duplicated, restricted to 0–23, and sorted ascending; an empty list
+  after cleaning becomes `no_op`, since a window over no hours constrains nothing
+- `factor` is clamped to 0–1, and a percentage reported the wrong way round
+  (`80` meaning an 80% *reduction*) is corrected to the fraction that remains
+- `minimum_energy_kwh` is clamped to the battery capacity; `max_grid_kwh` to ≥ 0
+- `applies` is forced consistent — `false` only for `no_op`, `true` for everything else
+- the result is rebuilt into exactly one entry per note in `note_index` order,
+  whatever the model returned, including when it returns too few, too many, or duplicates
+
+The layer only ever *narrows* what the model proposed. It never invents a directive.
+
+### 3 · Optimizer — `app/optimizer.py`
+
+A linear program over 24 hours with five variables per hour: grid purchase, solar used,
+battery charge, battery discharge, and battery energy after the hour. Subject to:
+
+```
+grid[h] + solar[h] + discharge[h] == demand[h] + charge[h]     energy balance
+energy[h] == energy[h-1] + charge[h] - discharge[h]            battery state
+energy[23] == initial_energy                                   end-of-day neutrality
+active_reserve[h] <= energy[h] <= capacity                     battery bounds
 ```
 
-Solid arrows are the normal path; dotted arrows are safe-failure paths. Every dotted
-path still ends in a valid 24-hour plan with HTTP 200 — an error response would forfeit
-the whole hidden case.
+Validated directives enter as hard constraints: `solar_reduction` lowers each hour's
+solar upper bound, `minimum_battery_reserve` raises the battery floor, the window
+directives force charge or discharge to 0, and `max_grid_window` caps the grid variable.
+The objective is `minimise Σ grid[h] × tariff[h]`. Because the problem is linear, the
+solver returns a **provably optimal** schedule, not a heuristic one — roughly 50 ms per
+scenario.
+
+Two details make the output exact. The solver may charge and discharge in the same hour,
+which is a wash without efficiency losses, so it is collapsed to one net action per hour.
+Solar and grid are then re-derived from the balance equation rather than read back from
+the solver, which guarantees the balance holds exactly at the precision we emit and that
+`grid_kwh` is never negative.
+
+### 4 · Self-check — `app/validator.py`
+
+Our own replay of the judge, run against every plan before it is returned: energy balance
+each hour, solar never exceeding effective solar, the battery chain hour by hour, bounds
+and rate limits, every directive window, end-of-day neutrality, and the three totals
+recomputed from `hourly_plan` itself rather than carried from the solver. All comparisons
+use the specification's 0.01 tolerance. A plan that fails its own replay is never sent.
+
+The same module runs offline against the organizer's published reference plans
+(`scripts/check_samples.py`), which is how we confirmed our reading of the energy rules
+matches theirs before trusting any of our own output.
 
 **Why the language model is genuinely in the path.** The structured interpretation the
 model produces is what becomes the optimizer's constraints — reduced solar, raised
