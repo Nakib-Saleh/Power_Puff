@@ -9,10 +9,10 @@ electricity schedule.
 
 | | |
 |---|---|
-| **Live base URL** | `<FILL IN AT SUBMISSION>` |
-| **Health** | `GET /health` → `{"status":"ok"}` |
+| **Live base URL** | **https://power-puff.onrender.com** |
+| **Health** | [`GET /health`](https://power-puff.onrender.com/health) → `{"status":"ok"}` |
 | **Main endpoint** | `POST /optimize-energy` |
-| **Docker image** | `<FILL IN AT SUBMISSION>` |
+| **Docker image** | `warmther1990/gridwise-llm:1.0.0` <br>digest `sha256:15390b2f142411d9c5b3b5e9c60c3670b5466c885890a683ff6e259cafd78349` |
 | **Model / provider** | Primary: **Groq** `openai/gpt-oss-120b` (OpenAI-compatible API), cascading to `qwen/qwen3.8-27b` and `openai/gpt-oss-20b`. Fallback: **Google Gemini** `gemini-3.5-flash` and its lite variants |
 | **Optimizer** | Linear programming — PuLP with the bundled CBC solver |
 
@@ -23,8 +23,8 @@ electricity schedule.
 Requires Python 3.10+ (developed on 3.13, container runs 3.12). No database, no build step.
 
 ```bash
-git clone <REPOSITORY_URL>
-cd <REPOSITORY_DIRECTORY>
+git clone https://github.com/Nakib-Saleh/Power_Puff.git
+cd Power_Puff
 
 python -m venv .venv
 # Linux/macOS:
@@ -131,7 +131,7 @@ RESULT: all checks passed.
 
 ```bash
 python scripts/test_api.py                          # local
-python scripts/test_api.py https://your-deployment  # deployed
+python scripts/test_api.py https://power-puff.onrender.com   # deployed
 ```
 
 For each of the 10 samples this checks the HTTP status, the exact response schema, the
@@ -245,11 +245,12 @@ Free keys: Groq at <https://console.groq.com/keys>, Gemini at <https://aistudio.
 ## 5. Docker fallback
 
 ```bash
-docker pull <IMAGE>:<TAG>
+docker pull warmther1990/gridwise-llm:1.0.0
 
 docker run --rm -p 8000:8000 \
-  -e GEMINI_API_KEYS=your_key_here \
-  <IMAGE>:<TAG>
+  -e OPENAI_COMPAT_API_KEYS=your_groq_key_here \
+  -e GEMINI_API_KEYS=your_gemini_key_here \
+  warmther1990/gridwise-llm:1.0.0
 
 curl http://127.0.0.1:8000/health
 # {"status":"ok"}
