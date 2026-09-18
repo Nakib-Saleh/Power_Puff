@@ -209,42 +209,60 @@ class Interpreter:
         return None
 
     async def _call_compat(self, client: httpx.AsyncClient, prompt: str) -> Optional[str]:
-        """Try each configured model in turn.
+        """Try each (model, key) pair until one answers.
 
-        Groq meters its free tier per MODEL (input tokens per minute), so when one
-        model is rate-limited another is usually still available. Cascading across
-        the list multiplies effective throughput without needing a second account.
+        Groq meters its free tier per MODEL *and* per organisation, so N models
+        across M accounts gives N*M independent token buckets. A 429 means that
+        one bucket is momentarily full, not that anything is broken, so we move
+        to the next pair. Keys from the same account share a bucket; keys from
+        different accounts do not, which is why a second account genuinely adds
+        capacity where a second key on the same account would not.
+
+        Rate-limit rejections come back without running inference, so cycling
+        past them is cheap. MAX_ATTEMPTS bounds the worst case so a bad run can
+        never approach the judge's 30 s limit.
         """
-        for model in self.compat_models:
-            key = self.compat_keys.next()
-            if key is None:
-                return None
-            try:
-                resp = await client.post(
-                    f"{self.compat_base}/chat/completions",
-                    headers={"Authorization": f"Bearer {key}"},
-                    json={
-                        "model": model,
-                        "temperature": 0,
-                        "response_format": {"type": "json_object"},
-                        "messages": [
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            {"role": "user", "content": prompt},
-                        ],
-                    },
-                )
-            except Exception:
-                continue
+        MAX_ATTEMPTS = 6
+        attempts = 0
+        keys = list(self.compat_keys.keys)
+        if not keys:
+            return None
 
-            if resp.status_code == 200:
+        for model in self.compat_models:
+            # Start each model at a different key so load spreads across
+            # accounts instead of always hammering the first one.
+            offset = self.compat_keys.pos
+            for n in range(len(keys)):
+                if attempts >= MAX_ATTEMPTS:
+                    return None
+                key = keys[(offset + n) % len(keys)]
+                attempts += 1
                 try:
-                    return resp.json()["choices"][0]["message"]["content"]
+                    resp = await client.post(
+                        f"{self.compat_base}/chat/completions",
+                        headers={"Authorization": f"Bearer {key}"},
+                        json={
+                            "model": model,
+                            "temperature": 0,
+                            "response_format": {"type": "json_object"},
+                            "messages": [
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": prompt},
+                            ],
+                        },
+                    )
                 except Exception:
                     continue
-            # 429 here is a per-model token limit, not a dead key, so the key
-            # stays in rotation and we simply move to the next model.
-            if resp.status_code in (401, 403):
-                self.compat_keys.penalise(key, 300)
+
+                if resp.status_code == 200:
+                    self.compat_keys.pos += 1
+                    try:
+                        return resp.json()["choices"][0]["message"]["content"]
+                    except Exception:
+                        continue
+                if resp.status_code in (401, 403):
+                    # A genuinely bad key, unlike a 429 -- stop using it.
+                    self.compat_keys.penalise(key, 300)
         return None
 
     # ------------------------------------------------------------------ main
