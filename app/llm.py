@@ -16,7 +16,6 @@ language model produces the structured interpretation that reaches the optimizer
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -38,92 +37,42 @@ from .directives import (
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-SYSTEM_PROMPT = """You convert short notes written by campus energy operators into structured scheduling directives for a 24-hour electricity plan.
+SYSTEM_PROMPT = """Convert campus energy operator notes into scheduling directives.
 
-You must classify each note as exactly ONE of these six types:
+TYPES (pick exactly one per note):
+solar_reduction        - usable solar drops for some hours. fields: hours, factor
+minimum_battery_reserve- battery must stay at/above a level. fields: hours, minimum_energy_kwh
+no_charge_window       - battery cannot charge. fields: hours
+no_discharge_window    - battery cannot discharge/drain. fields: hours
+max_grid_window        - grid import capped per hour. fields: hours, max_grid_kwh
+no_op                  - no effect on today's schedule. no fields
 
-1. "solar_reduction" - usable solar power will be lower than forecast during some hours.
-   fields: hours, factor
-2. "minimum_battery_reserve" - the battery must stay at or above some energy level during some hours.
-   fields: hours, minimum_energy_kwh
-3. "no_charge_window" - the battery cannot be charged during some hours.
-   fields: hours
-4. "no_discharge_window" - the battery cannot be discharged/drained during some hours.
-   fields: hours
-5. "max_grid_window" - electricity imported from the grid must not exceed a limit in each of some hours.
-   fields: hours, max_grid_kwh
-6. "no_op" - the note has no effect on today's electricity schedule.
-   fields: none
+RULES:
+1. Hours are whole hours, START INCLUSIVE, END EXCLUSIVE, unique ints 0-23 ascending.
+   "1 PM to 3 PM"=[13,14]  "2 AM until 5 AM"=[2,3,4]  "6 PM to 10 PM"=[18,19,20,21]
+   "noon until 2 PM"=[12,13]  "11 AM-2 PM"=[11,12,13]  "at 3 PM"=[15]
+2. factor = fraction REMAINING, not lost. "drops to 20%"=0.2. "80% reduction"=0.2.
+   "half"=0.5. "one-fifth"=0.2. "25% of forecast"=0.25. Always 0..1.
+3. Percentage reserves convert via the battery capacity given. 50% of 200kWh = 100.
+4. "charger isolated/unavailable/do not charge"=no_charge_window.
+   "must not discharge/drain/must hold charge"=no_discharge_window.
+5. Menus, deadlines, bookings, notices, staffing, next week/month, contracts = no_op.
+   A note may mention energy and still be no_op if it does not constrain today.
+6. Never invent types outside the six. Never alter demand/tariff/battery limits.
+   If unsure, use no_op.
 
-CRITICAL RULES
+Return ONLY JSON, one entry per note, in order:
+{"interpretations":[{"note_index":0,"applies":true,"directive_type":"solar_reduction","hours":[13,14],"factor":0.2,"minimum_energy_kwh":null,"max_grid_kwh":null,"explanation":"short"}]}
+applies=false ONLY for no_op. Unused numeric fields null."""
 
-A. HOURS ARE WHOLE HOURS, START INCLUSIVE, END EXCLUSIVE.
-   "1 PM to 3 PM"        -> [13, 14]
-   "from 2 AM until 5 AM" -> [2, 3, 4]
-   "between 11 AM and 2 PM" -> [11, 12, 13]
-   "6 PM until 10 PM"    -> [18, 19, 20, 21]
-   "noon until 2 PM"     -> [12, 13]
-   "at 3 PM" (single hour) -> [15]
-   Always output unique integers 0-23 in ascending order.
-
-B. "factor" IS THE FRACTION THAT REMAINS, NOT THE AMOUNT LOST.
-   "drops to 20% of forecast"       -> factor 0.2
-   "an 80% reduction in solar"      -> factor 0.2
-   "about half the usual output"    -> factor 0.5
-   "roughly one-fifth of normal"    -> factor 0.2
-   "treated as 25% of the forecast" -> factor 0.25
-   factor is always between 0 and 1.
-
-C. RESERVES EXPRESSED AS A PERCENTAGE MUST BE CONVERTED TO kWh using the battery
-   capacity given in the request. "keep at least 50% of capacity" with a 200 kWh
-   battery -> minimum_energy_kwh 100.
-
-D. CHARGE vs DISCHARGE - read carefully.
-   "charger is isolated / charging circuit unavailable / do not charge" -> no_charge_window
-   "must not discharge / do not drain / battery must hold its charge"   -> no_discharge_window
-
-E. NOTES THAT DO NOT CHANGE TODAY'S SCHEDULE ARE "no_op".
-   Anything about menus, deadlines, bookings, notices, staffing, next week,
-   next month, or contracts is no_op. A note can mention energy and still be
-   no_op if it does not constrain today's 24 hours.
-
-F. NEVER invent a directive type outside the six listed. Never change demand,
-   tariff, or battery limits. When genuinely unsure, choose no_op.
-
-OUTPUT
-Return JSON only, in exactly this shape, with one entry per note in the order
-the notes were given:
-
+FEW_SHOT = """Example - capacity 300 kWh:
+0: "Inverter work 9 AM to 11 AM leaves about 40% of usual PV."
+1: "Keep no less than a third of the pack from 7 PM to 10 PM."
+2: "Canteen meeting moved to Thursday."
 {"interpretations":[
-  {"note_index":0,"applies":true,"directive_type":"solar_reduction","hours":[13,14],"factor":0.2,"minimum_energy_kwh":null,"max_grid_kwh":null,"explanation":"one short sentence"},
-  {"note_index":1,"applies":false,"directive_type":"no_op","hours":[],"factor":null,"minimum_energy_kwh":null,"max_grid_kwh":null,"explanation":"one short sentence"}
-]}
-
-Set applies to false only for no_op. Unused numeric fields must be null."""
-
-FEW_SHOT = """EXAMPLES
-
-Battery capacity: 300 kWh
-Notes:
-0: "Inverter servicing between 9 AM and 11 AM should leave us about 40% of the usual PV yield."
-1: "Please keep no less than a third of the pack in reserve from 7 PM to 10 PM."
-2: "Canteen supplier meeting has been pushed to Thursday."
-Answer:
-{"interpretations":[
-{"note_index":0,"applies":true,"directive_type":"solar_reduction","hours":[9,10],"factor":0.4,"minimum_energy_kwh":null,"max_grid_kwh":null,"explanation":"Servicing leaves 40% of forecast solar for those hours."},
-{"note_index":1,"applies":true,"directive_type":"minimum_battery_reserve","hours":[19,20,21],"factor":null,"minimum_energy_kwh":100,"max_grid_kwh":null,"explanation":"A third of the 300 kWh pack is 100 kWh."},
-{"note_index":2,"applies":false,"directive_type":"no_op","hours":[],"factor":null,"minimum_energy_kwh":null,"max_grid_kwh":null,"explanation":"Unrelated to today's energy schedule."}
-]}
-
-Battery capacity: 180 kWh
-Notes:
-0: "Intake from the utility is limited to 140 kWh per hour from 17:00 to 20:00 while the substation is worked on."
-1: "The battery cannot accept charge during the morning inspection, 9 until 11."
-Answer:
-{"interpretations":[
-{"note_index":0,"applies":true,"directive_type":"max_grid_window","hours":[17,18,19],"factor":null,"minimum_energy_kwh":null,"max_grid_kwh":140,"explanation":"Grid import capped at 140 kWh in each listed hour."},
-{"note_index":1,"applies":true,"directive_type":"no_charge_window","hours":[9,10],"factor":null,"minimum_energy_kwh":null,"max_grid_kwh":null,"explanation":"Charging is unavailable during the inspection."}
-]}"""
+{"note_index":0,"applies":true,"directive_type":"solar_reduction","hours":[9,10],"factor":0.4,"minimum_energy_kwh":null,"max_grid_kwh":null,"explanation":"40% of solar remains."},
+{"note_index":1,"applies":true,"directive_type":"minimum_battery_reserve","hours":[19,20,21],"factor":null,"minimum_energy_kwh":100,"max_grid_kwh":null,"explanation":"A third of 300 is 100."},
+{"note_index":2,"applies":false,"directive_type":"no_op","hours":[],"factor":null,"minimum_energy_kwh":null,"max_grid_kwh":null,"explanation":"Unrelated to today."}]}"""
 
 
 def _keys(*names: str) -> List[str]:
@@ -167,7 +116,8 @@ class Interpreter:
         self.models = [
             m.strip()
             for m in os.getenv(
-                "GEMINI_MODEL", "gemini-3.5-flash,gemini-3-flash-preview,gemini-flash-latest"
+                "GEMINI_MODEL",
+                "gemini-3.5-flash,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3-flash-preview,gemini-flash-latest",
             ).split(",")
             if m.strip()
         ]
@@ -175,7 +125,14 @@ class Interpreter:
         self.compat_base = os.getenv(
             "OPENAI_COMPAT_BASE_URL", "https://api.groq.com/openai/v1"
         ).rstrip("/")
-        self.compat_model = os.getenv("OPENAI_COMPAT_MODEL", "llama-3.3-70b-versatile")
+        self.compat_models = [
+            m.strip()
+            for m in os.getenv(
+                "OPENAI_COMPAT_MODEL",
+                "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b",
+            ).split(",")
+            if m.strip()
+        ]
         self.timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "12"))
         self.cache: Dict[str, List[Dict[str, Any]]] = {}
         self.stats = {"llm": 0, "cache": 0, "fallback": 0}
@@ -188,7 +145,7 @@ class Interpreter:
         if self.gemini:
             return f"google:{self.models[0]}"
         if self.compat_keys:
-            return f"openai-compatible:{self.compat_model}"
+            return f"openai-compatible:{self.compat_models[0]}"
         return "deterministic-fallback-only"
 
     # ---------------------------------------------------------------- prompt
@@ -218,61 +175,95 @@ class Interpreter:
                     "maxOutputTokens": 2048,
                 },
             }
-            if not model.startswith("gemini-1"):
-                # Disable "thinking" tokens on every 2.x/3.x model for latency;
-                # older 1.x models predate this parameter and reject it.
-                body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+            # Disabling "thinking" tokens roughly halves latency, but not every
+            # model accepts the parameter -- some reject it with a 400. Try with
+            # it first, then retry once without before giving up on this model.
+            body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
 
-            try:
-                resp = await client.post(
-                    GEMINI_URL.format(model=model),
-                    headers={"x-goog-api-key": key, "Content-Type": "application/json"},
-                    json=body,
-                )
-            except Exception:
-                continue
-
-            if resp.status_code == 200:
+            for attempt in range(2):
                 try:
-                    data = resp.json()
-                    parts = data["candidates"][0]["content"]["parts"]
-                    return "".join(p.get("text", "") for p in parts)
+                    resp = await client.post(
+                        GEMINI_URL.format(model=model),
+                        headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                        json=body,
+                    )
                 except Exception:
+                    break
+
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        parts = data["candidates"][0]["content"]["parts"]
+                        return "".join(p.get("text", "") for p in parts)
+                    except Exception:
+                        break
+
+                if resp.status_code in (429, 403):
+                    self.gemini.penalise(key)
+                    break
+                if resp.status_code == 400 and attempt == 0:
+                    body["generationConfig"].pop("thinkingConfig", None)
                     continue
-            if resp.status_code in (429, 403):
-                self.gemini.penalise(key)
-            # 400/404 -> try the next model in the list
+                break
+            # exhausted this model (404/400/quota) -> fall through to the next one
         return None
 
     async def _call_compat(self, client: httpx.AsyncClient, prompt: str) -> Optional[str]:
-        key = self.compat_keys.next()
-        if key is None:
+        """Try each (model, key) pair until one answers.
+
+        Groq meters its free tier per MODEL *and* per organisation, so N models
+        across M accounts gives N*M independent token buckets. A 429 means that
+        one bucket is momentarily full, not that anything is broken, so we move
+        to the next pair. Keys from the same account share a bucket; keys from
+        different accounts do not, which is why a second account genuinely adds
+        capacity where a second key on the same account would not.
+
+        Rate-limit rejections come back without running inference, so cycling
+        past them is cheap. MAX_ATTEMPTS bounds the worst case so a bad run can
+        never approach the judge's 30 s limit.
+        """
+        MAX_ATTEMPTS = 6
+        attempts = 0
+        keys = list(self.compat_keys.keys)
+        if not keys:
             return None
-        try:
-            resp = await client.post(
-                f"{self.compat_base}/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": self.compat_model,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                },
-            )
-        except Exception:
-            return None
-        if resp.status_code == 429:
-            self.compat_keys.penalise(key)
-            return None
-        if resp.status_code != 200:
-            return None
-        try:
-            return resp.json()["choices"][0]["message"]["content"]
-        except Exception:
-            return None
+
+        for model in self.compat_models:
+            # Start each model at a different key so load spreads across
+            # accounts instead of always hammering the first one.
+            offset = self.compat_keys.pos
+            for n in range(len(keys)):
+                if attempts >= MAX_ATTEMPTS:
+                    return None
+                key = keys[(offset + n) % len(keys)]
+                attempts += 1
+                try:
+                    resp = await client.post(
+                        f"{self.compat_base}/chat/completions",
+                        headers={"Authorization": f"Bearer {key}"},
+                        json={
+                            "model": model,
+                            "temperature": 0,
+                            "response_format": {"type": "json_object"},
+                            "messages": [
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                {"role": "user", "content": prompt},
+                            ],
+                        },
+                    )
+                except Exception:
+                    continue
+
+                if resp.status_code == 200:
+                    self.compat_keys.pos += 1
+                    try:
+                        return resp.json()["choices"][0]["message"]["content"]
+                    except Exception:
+                        continue
+                if resp.status_code in (401, 403):
+                    # A genuinely bad key, unlike a 429 -- stop using it.
+                    self.compat_keys.penalise(key, 300)
+        return None
 
     # ------------------------------------------------------------------ main
 
